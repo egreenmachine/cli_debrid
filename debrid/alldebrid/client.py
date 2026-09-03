@@ -57,6 +57,8 @@ class AllDebridProvider(DebridProvider):
         self._cached_torrent_titles = {}  # Store torrent titles for cached content
         self._all_torrent_ids = {}  # Store all torrent IDs for tracking
         self._upload_ready_status = {}  # Store 'ready' field from upload responses (torrent_id -> bool)
+        self._download_links = {}  # Store unlocked download links (torrent_id -> List[Dict])
+        self._pending_link_generation = set()  # Torrent IDs awaiting link generation once ready
         # Only initialize phalanx cache if enabled
         self.phalanx_enabled = get_setting('UI Settings', 'enable_phalanx_db', default=False)
         self.phalanx_cache = PhalanxDBClassManager() if self.phalanx_enabled else None
@@ -257,9 +259,12 @@ class AllDebridProvider(DebridProvider):
             torrent_id = None
             try:
                 # Add the magnet/torrent to AllDebrid
+                # Cache checks add and usually remove the torrent again, so skip
+                # link generation here - it happens on the real add.
                 torrent_id = self.add_torrent(
                     magnet_link if magnet_link and magnet_link.startswith('magnet:') else None,
-                    temp_file_path
+                    temp_file_path,
+                    generate_links=False
                 )
 
                 if not torrent_id:
@@ -459,6 +464,162 @@ class AllDebridProvider(DebridProvider):
                 })
         return files
 
+    @staticmethod
+    def _auto_generate_links_enabled() -> bool:
+        """Whether download links should be unlocked automatically after adding a torrent."""
+        return bool(get_setting('Debrid Provider', 'auto_generate_links', default=True))
+
+    def _wait_for_delayed_link(self, delayed_id: str, max_attempts: int = 6) -> Optional[str]:
+        """
+        Poll AllDebrid's /link/delayed endpoint until a delayed link becomes available.
+
+        Returns the direct link, or None if it never resolved.
+        """
+        for attempt in range(max_attempts):
+            time.sleep(min(2 + attempt, 10))
+            try:
+                result = make_request('GET', '/link/delayed', self.api_key,
+                                      params={'id': delayed_id}, use_query_auth=True)
+            except Exception as e:
+                logging.warning(f"Error polling delayed link {delayed_id}: {str(e)}")
+                return None
+
+            if not result or result.get('status') != 'success':
+                return None
+
+            data = result.get('data', {})
+            delayed_status = data.get('status')
+            # 1 = still processing, 2 = ready, 3 = error
+            if delayed_status == 2:
+                return data.get('link')
+            if delayed_status == 3:
+                logging.warning(f"AllDebrid reported an error generating delayed link {delayed_id}")
+                return None
+
+        logging.warning(f"Timed out waiting for delayed link {delayed_id}")
+        return None
+
+    def unlock_link(self, link: str) -> Optional[str]:
+        """
+        Convert a locked AllDebrid link into a direct download link via /link/unlock.
+
+        Returns the direct link, or None if unlocking failed.
+        """
+        if not link:
+            return None
+
+        try:
+            result = make_request('GET', '/link/unlock', self.api_key,
+                                  params={'link': link}, use_query_auth=True)
+        except Exception as e:
+            logging.warning(f"Failed to unlock link {link}: {str(e)}")
+            return None
+
+        if not result or result.get('status') != 'success':
+            logging.warning(f"Unexpected response unlocking link {link}: {result}")
+            return None
+
+        data = result.get('data', {})
+
+        # Some hosts return a delayed id instead of an immediate link
+        delayed_id = data.get('delayed')
+        if delayed_id:
+            logging.debug(f"Link unlock delayed (id={delayed_id}), polling for completion")
+            return self._wait_for_delayed_link(str(delayed_id))
+
+        return data.get('link')
+
+    def generate_download_links(self, torrent_id: str, info: Optional[Dict] = None,
+                                video_only: bool = True) -> List[Dict]:
+        """
+        Unlock the links of a ready torrent so direct download links are generated.
+
+        AllDebrid returns locked links from /magnet/status; they only become usable
+        download links once passed through /link/unlock. This mirrors the file
+        selection step Real-Debrid performs on add.
+
+        Returns a list of {path, name, bytes, link, direct_link} dicts.
+        """
+        if self._download_links.get(torrent_id):
+            return self._download_links[torrent_id]
+
+        if info is None:
+            info = self.get_torrent_info(torrent_id)
+            # get_torrent_info may have generated them on our behalf
+            if self._download_links.get(torrent_id):
+                return self._download_links[torrent_id]
+        if not info:
+            return []
+
+        files = info.get('files', []) or self._extract_files_from_info(info)
+        candidates = []
+        for file_info in files:
+            filename = file_info.get('path', '') or file_info.get('name', '')
+            if not file_info.get('link'):
+                continue
+            if video_only and (not is_video_file(filename) or is_unwanted_file(filename)):
+                continue
+            candidates.append(file_info)
+
+        # Fall back to every linked file if nothing matched the video filter
+        if not candidates and video_only:
+            candidates = [f for f in files if f.get('link')]
+
+        if not candidates:
+            logging.debug(f"No unlockable links found for torrent {torrent_id}")
+            return []
+
+        generated = []
+        for file_info in candidates:
+            direct_link = self.unlock_link(file_info.get('link'))
+            if not direct_link:
+                continue
+            file_info['direct_link'] = direct_link
+            generated.append({
+                'path': file_info.get('path', '') or file_info.get('name', ''),
+                'name': file_info.get('name', '') or file_info.get('path', ''),
+                'bytes': file_info.get('bytes', 0),
+                'link': file_info.get('link'),
+                'direct_link': direct_link
+            })
+
+        if generated:
+            self._download_links[torrent_id] = generated
+            self._pending_link_generation.discard(torrent_id)
+            logging.info(f"Generated {len(generated)} download link(s) for torrent {torrent_id}")
+        else:
+            logging.warning(f"Failed to generate any download links for torrent {torrent_id}")
+
+        return generated
+
+    def get_download_links(self, torrent_id: str) -> List[Dict]:
+        """Get previously generated download links for a torrent"""
+        return self._download_links.get(torrent_id, [])
+
+    def _handle_link_generation(self, torrent_id: str, is_ready: bool,
+                                info: Optional[Dict] = None) -> None:
+        """
+        Generate download links for a torrent, or mark it for generation later.
+
+        Link generation never fails an add - errors are logged and the torrent is
+        left queued so a later status check can retry.
+        """
+        if self._download_links.get(torrent_id):
+            return
+
+        if not is_ready:
+            # Not cached yet - unlock once the download completes
+            self._pending_link_generation.add(torrent_id)
+            logging.debug(f"Torrent {torrent_id} not ready yet; deferring link generation")
+            return
+
+        try:
+            if not self.generate_download_links(torrent_id, info=info):
+                self._pending_link_generation.add(torrent_id)
+        except Exception as e:
+            logging.error(f"Error generating download links for torrent {torrent_id}: {str(e)}")
+            self._pending_link_generation.add(torrent_id)
+
     def get_cached_torrent_id(self, hash_value: str) -> Optional[str]:
         """Get stored torrent ID for a cached hash"""
         return self._cached_torrent_ids.get(hash_value)
@@ -506,13 +667,22 @@ class AllDebridProvider(DebridProvider):
             logging.error(f"Error listing active torrents: {str(e)}")
             return []
 
-    def add_torrent(self, magnet_link: Optional[str], temp_file_path: Optional[str] = None) -> Optional[str]:
+    def add_torrent(self, magnet_link: Optional[str], temp_file_path: Optional[str] = None,
+                    generate_links: bool = True) -> Optional[str]:
         """Add a torrent to AllDebrid.
+
+        Args:
+            magnet_link: Magnet URI to add
+            temp_file_path: Path to a .torrent file to upload instead
+            generate_links: Unlock the torrent's links once it is ready so direct
+                download links are generated. Disabled for cache-check adds, where
+                the torrent is usually removed right away.
 
         Returns:
             The torrent ID if successful, None otherwise.
             Also stores the 'ready' status from upload response in self._upload_ready_status[torrent_id].
         """
+        auto_generate = generate_links and self._auto_generate_links_enabled()
         try:
             hash_value = None
 
@@ -559,6 +729,8 @@ class AllDebridProvider(DebridProvider):
                         # Existing torrent - check if it's ready (statusCode 4)
                         existing_ready = existing.get('statusCode', 0) == 4
                         self._upload_ready_status[existing_id] = existing_ready
+                        if auto_generate:
+                            self._handle_link_generation(existing_id, existing_ready)
                         return existing_id
 
                 # Add magnet link
@@ -662,6 +834,13 @@ class AllDebridProvider(DebridProvider):
                     # Store ready status: is_ready from upload response OR statusCode 4 means cached
                     final_ready = is_ready or status_code == 4
                     self._upload_ready_status[torrent_id] = final_ready
+
+                    # Generate the direct download links now that the torrent is
+                    # on AllDebrid. If it is still downloading, defer until the
+                    # status check sees it reach 'Ready'.
+                    if auto_generate:
+                        self._handle_link_generation(torrent_id, status_code == 4, info=info)
+
                     return torrent_id
 
                 # Still queued, wait
@@ -843,6 +1022,24 @@ class AllDebridProvider(DebridProvider):
             else:
                 info['status'] = 'error'
 
+            # Generate download links for torrents that were added before they
+            # finished downloading, now that they are ready.
+            if status_code == 4 and torrent_id in self._pending_link_generation:
+                try:
+                    self.generate_download_links(torrent_id, info=info)
+                except Exception as e:
+                    logging.error(f"Error generating deferred download links for torrent {torrent_id}: {str(e)}")
+
+            # Expose any generated direct links alongside the file list
+            generated = self._download_links.get(torrent_id)
+            if generated:
+                by_link = {g['link']: g['direct_link'] for g in generated if g.get('link')}
+                for file_info in info['files']:
+                    direct_link = by_link.get(file_info.get('link'))
+                    if direct_link:
+                        file_info['direct_link'] = direct_link
+                info['download_links'] = generated
+
             return info
 
         except Exception as e:
@@ -887,6 +1084,9 @@ class AllDebridProvider(DebridProvider):
     def remove_torrent(self, torrent_id: str, removal_reason: str = "Manual removal") -> None:
         """Remove a torrent from AllDebrid"""
         try:
+            # Don't generate links for a torrent we are about to delete
+            self._pending_link_generation.discard(torrent_id)
+
             # Get torrent info before removal to get the hash
             hash_value = None
             try:
@@ -910,6 +1110,10 @@ class AllDebridProvider(DebridProvider):
 
             # Update status and tracking
             self.update_status(torrent_id, TorrentStatus.REMOVED)
+
+            # Generated links are no longer valid for a removed torrent
+            self._download_links.pop(torrent_id, None)
+            self._pending_link_generation.discard(torrent_id)
 
             if hash_value:
                 from database.torrent_tracking import mark_torrent_removed

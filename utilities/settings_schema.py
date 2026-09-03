@@ -232,6 +232,11 @@ SETTINGS_SCHEMA = {
             "description": "API key for the debrid service",
             "default": "demo_key",
             "sensitive": True
+        },
+        "auto_generate_links": {
+            "type": "boolean",
+            "description": "AllDebrid only: automatically unlock a torrent's files into direct download links as soon as it is added (and once it finishes downloading, for uncached torrents)",
+            "default": True
         }
     },
     "TMDB": {
