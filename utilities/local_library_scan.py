@@ -2030,7 +2030,24 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
                 # separate database entries for each (similar to how Plex mode handles multiple files)
                 # This ensures all files from a torrent are properly tracked in the database
                 # Skip if skip_multifile_scan is True (prevents redundant folder scans)
-                if source_folder and not skip_multifile_scan:
+                #
+                # Also skip when the file was found directly in original_files_path
+                # (Attempt 7). That means the provider presents files flat, with no
+                # per-torrent folder - AllDebrid's WebDAV links/ folder, for example.
+                # The sibling files there are the entire library rather than the rest
+                # of this torrent, and the episode branch below matches on season and
+                # episode number alone, so a flat folder would mislink a different
+                # show's SxxExx as an "alternate version" of this one.
+                in_flat_root = bool(source_folder and original_path and
+                                    os.path.normpath(source_folder) == os.path.normpath(original_path))
+                if in_flat_root:
+                    logging.debug(
+                        f"[MultiFile] Skipping folder scan: file was found directly in "
+                        f"original_files_path ({original_path}), so there is no torrent "
+                        f"folder to enumerate."
+                    )
+
+                if source_folder and not skip_multifile_scan and not in_flat_root:
                     try:
                         all_video_files = _find_all_video_files_in_folder(source_folder, source_file)
                         # Filter out the primary file we already processed
