@@ -3,6 +3,7 @@ import os
 import pickle
 from datetime import datetime, timedelta
 import feedparser
+import requests
 from typing import List, Dict, Any, Tuple, Union
 from utilities.settings import get_setting
 from database.database_reading import get_media_item_presence, get_media_item_presence_overall
@@ -31,6 +32,65 @@ def save_rss_cache(cache, cache_file):
     except Exception as e:
         logging.error(f"Error saving Plex RSS cache: {e}")
 
+TMDB_BASE_URL = "https://api.themoviedb.org/3"
+
+
+def _tvdb_to_imdb_via_tmdb(tvdb_id: str, title: str = None) -> str:
+    """Resolve a TVDB show id to an IMDB id using TMDB.
+
+    Plex RSS gives movies an imdb:// guid but shows a tvdb:// one, so TV needs a
+    conversion step. TMDB only needs an API key (Additional Settings -> TMDB),
+    which keeps TV working without a Trakt account.
+    """
+    api_key = get_setting('TMDB', 'api_key', '')
+    if not api_key:
+        logging.debug(f"No TMDB API key configured; cannot convert TVDB ID {tvdb_id} via TMDB")
+        return None
+
+    label = title if title else 'Unknown title'
+    try:
+        response = requests.get(
+            f"{TMDB_BASE_URL}/find/{tvdb_id}",
+            params={'api_key': api_key, 'external_source': 'tvdb_id'},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            logging.warning(f"TMDB find failed for TVDB ID {tvdb_id} ({label}). "
+                            f"Status code: {response.status_code}")
+            return None
+
+        tv_results = response.json().get('tv_results') or []
+        if not tv_results:
+            logging.warning(f"TMDB has no show matching TVDB ID {tvdb_id} ({label})")
+            return None
+
+        tmdb_id = tv_results[0].get('id')
+        if not tmdb_id:
+            return None
+
+        external = requests.get(
+            f"{TMDB_BASE_URL}/tv/{tmdb_id}/external_ids",
+            params={'api_key': api_key},
+            timeout=10,
+        )
+        if external.status_code != 200:
+            logging.warning(f"TMDB external_ids failed for TMDB show {tmdb_id} ({label}). "
+                            f"Status code: {external.status_code}")
+            return None
+
+        imdb_id = external.json().get('imdb_id')
+        if imdb_id:
+            logging.debug(f"Converted TVDB ID {tvdb_id} to IMDB ID {imdb_id} via TMDB for {label}")
+            return imdb_id
+
+        logging.warning(f"TMDB knows TVDB ID {tvdb_id} ({label}) but has no IMDB ID for it")
+        return None
+
+    except Exception as e:
+        logging.warning(f"Error converting TVDB ID {tvdb_id} to IMDB ID via TMDB: {e}")
+        return None
+
+
 def extract_imdb_id(guid: str, title: str = None) -> str:
     """Extract IMDB ID from a Plex RSS item guid."""
     if 'imdb://' in guid:
@@ -43,6 +103,14 @@ def extract_imdb_id(guid: str, title: str = None) -> str:
             imdb_id = db_manager.get_imdb_from_tvdb(tvdb_id)
             if imdb_id:
                 logging.debug(f"Found IMDB ID {imdb_id} for TVDB ID {tvdb_id} in database")
+                return imdb_id
+
+            # Then TMDB, which needs only an API key. Trakt below needs an
+            # authenticated account, so without this every show in the feed is
+            # dropped on setups that don't use Trakt.
+            imdb_id = _tvdb_to_imdb_via_tmdb(tvdb_id, title)
+            if imdb_id:
+                db_manager.add_tvdb_to_imdb_mapping(tvdb_id, imdb_id, 'show')
                 return imdb_id
 
             # If not in database, use Trakt to get it and store for future
