@@ -36,6 +36,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+# Import routes before debrid. debrid/__init__ pulls in routes.api_tracker, which
+# initialises the routes package, which comes back around to
+# "from debrid import reset_provider" - and debrid is only half-built at that
+# point, so the import fails. Importing routes first lets debrid complete inside
+# that chain instead. main.py gets this ordering for free by importing
+# routes.notifications long before any debrid module.
+import routes  # noqa: F401,E402
+
 from debrid.alldebrid.api import make_request, MAGNET_STATUS_CODES  # noqa: E402
 from debrid.alldebrid.client import AllDebridProvider  # noqa: E402
 from debrid.common import is_unwanted_file, is_video_file  # noqa: E402
