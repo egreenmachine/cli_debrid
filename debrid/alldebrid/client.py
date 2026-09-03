@@ -390,6 +390,14 @@ class AllDebridProvider(DebridProvider):
                     self._cached_torrent_ids[hash_value] = torrent_id
                     self._cached_torrent_titles[hash_value] = info.get('filename', '')
 
+                    # A cached torrent found here is never re-added: the caller
+                    # picks it up via get_cached_torrent_id() + get_torrent_info().
+                    # Mark it so that get_torrent_info() unlocks the links when the
+                    # torrent is actually used. If it gets removed below,
+                    # remove_torrent() clears the mark again.
+                    if self._auto_generate_links_enabled():
+                        self._pending_link_generation.add(torrent_id)
+
                     if torrent_was_preexisting:
                         logging.info(f"{log_prefix} Skipping removal of pre-existing cached torrent {torrent_id}")
                     elif local_remove_cached:
