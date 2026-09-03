@@ -6,6 +6,7 @@ from urllib.parse import unquote
 import hashlib
 import bencodepy
 import asyncio
+from contextlib import contextmanager
 
 from ..base import DebridProvider, TooManyDownloadsError, ProviderUnavailableError, TorrentAdditionError
 from ..common import (
@@ -59,7 +60,7 @@ class AllDebridProvider(DebridProvider):
         self._all_torrent_ids = {}  # Store all torrent IDs for tracking
         self._upload_ready_status = {}  # Store 'ready' field from upload responses (torrent_id -> bool)
         self._download_links = {}  # Store unlocked download links (torrent_id -> List[Dict])
-        self._pending_link_generation = set()  # Torrent IDs awaiting link generation once ready
+        self._suppress_link_generation = 0  # Depth counter; >0 disables automatic unlocking
         # Only initialize phalanx cache if enabled
         self.phalanx_enabled = get_setting('UI Settings', 'enable_phalanx_db', default=False)
         self.phalanx_cache = PhalanxDBClassManager() if self.phalanx_enabled else None
@@ -289,8 +290,10 @@ class AllDebridProvider(DebridProvider):
                 upload_indicated_ready = self._upload_ready_status.get(torrent_id, False)
                 logging.debug(f"{log_prefix} add_torrent returned: id={torrent_id}, stored ready={upload_indicated_ready}")
 
-                # Get torrent info
-                info = self.get_torrent_info(torrent_id)
+                # Get torrent info. Suppress link generation: this is still a
+                # cache probe, and most of these torrents are about to be deleted.
+                with self._link_generation_suppressed():
+                    info = self.get_torrent_info(torrent_id)
                 if not info:
                     logging.error(f"{log_prefix} Failed to get torrent info for ID: {torrent_id}")
                     try:
@@ -390,14 +393,9 @@ class AllDebridProvider(DebridProvider):
                     self._cached_torrent_ids[hash_value] = torrent_id
                     self._cached_torrent_titles[hash_value] = info.get('filename', '')
 
-                    # A cached torrent found here is never re-added: the caller
-                    # picks it up via get_cached_torrent_id() + get_torrent_info().
-                    # Mark it so that get_torrent_info() unlocks the links when the
-                    # torrent is actually used. If it gets removed below,
-                    # remove_torrent() clears the mark again.
-                    if self._auto_generate_links_enabled():
-                        self._pending_link_generation.add(torrent_id)
-
+                    # Nothing to do for links here: a cached torrent is picked up
+                    # by the caller via get_cached_torrent_id() + get_torrent_info(),
+                    # which unlocks it then.
                     if torrent_was_preexisting:
                         logging.info(f"{log_prefix} Skipping removal of pre-existing cached torrent {torrent_id}")
                     elif local_remove_cached:
@@ -490,6 +488,23 @@ class AllDebridProvider(DebridProvider):
         """Whether download links should be unlocked automatically after adding a torrent."""
         return bool(get_setting('Debrid Provider', 'auto_generate_links', default=True))
 
+    @contextmanager
+    def _link_generation_suppressed(self):
+        """
+        Disable automatic link generation for the duration of the block.
+
+        get_torrent_info() unlocks any Ready torrent it sees, which is what makes
+        generation survive restarts. That is wrong in three places: while probing
+        candidates during a cache check, while deleting a torrent, and while
+        generate_download_links() is fetching info for itself. Those wrap
+        themselves in this.
+        """
+        self._suppress_link_generation += 1
+        try:
+            yield
+        finally:
+            self._suppress_link_generation -= 1
+
     def _wait_for_delayed_link(self, delayed_id: str, max_attempts: int = 6) -> Optional[str]:
         """
         Poll AllDebrid's /link/delayed endpoint until a delayed link becomes available.
@@ -565,10 +580,8 @@ class AllDebridProvider(DebridProvider):
             return self._download_links[torrent_id]
 
         if info is None:
-            info = self.get_torrent_info(torrent_id)
-            # get_torrent_info may have generated them on our behalf
-            if self._download_links.get(torrent_id):
-                return self._download_links[torrent_id]
+            with self._link_generation_suppressed():
+                info = self.get_torrent_info(torrent_id)
         if not info:
             return []
 
@@ -606,7 +619,6 @@ class AllDebridProvider(DebridProvider):
 
         if generated:
             self._download_links[torrent_id] = generated
-            self._pending_link_generation.discard(torrent_id)
             logging.info(f"Generated {len(generated)} download link(s) for torrent {torrent_id}")
         else:
             logging.warning(f"Failed to generate any download links for torrent {torrent_id}")
@@ -616,30 +628,6 @@ class AllDebridProvider(DebridProvider):
     def get_download_links(self, torrent_id: str) -> List[Dict]:
         """Get previously generated download links for a torrent"""
         return self._download_links.get(torrent_id, [])
-
-    def _handle_link_generation(self, torrent_id: str, is_ready: bool,
-                                info: Optional[Dict] = None) -> None:
-        """
-        Generate download links for a torrent, or mark it for generation later.
-
-        Link generation never fails an add - errors are logged and the torrent is
-        left queued so a later status check can retry.
-        """
-        if self._download_links.get(torrent_id):
-            return
-
-        if not is_ready:
-            # Not cached yet - unlock once the download completes
-            self._pending_link_generation.add(torrent_id)
-            logging.debug(f"Torrent {torrent_id} not ready yet; deferring link generation")
-            return
-
-        try:
-            if not self.generate_download_links(torrent_id, info=info):
-                self._pending_link_generation.add(torrent_id)
-        except Exception as e:
-            logging.error(f"Error generating download links for torrent {torrent_id}: {str(e)}")
-            self._pending_link_generation.add(torrent_id)
 
     def get_cached_torrent_id(self, hash_value: str) -> Optional[str]:
         """Get stored torrent ID for a cached hash"""
@@ -706,7 +694,14 @@ class AllDebridProvider(DebridProvider):
             The torrent ID if successful, None otherwise.
             Also stores the 'ready' status from upload response in self._upload_ready_status[torrent_id].
         """
-        auto_generate = generate_links and self._auto_generate_links_enabled()
+        if generate_links:
+            return self._add_torrent(magnet_link, temp_file_path)
+        with self._link_generation_suppressed():
+            return self._add_torrent(magnet_link, temp_file_path)
+
+    def _add_torrent(self, magnet_link: Optional[str], temp_file_path: Optional[str] = None) -> Optional[str]:
+        """Add a torrent. Links are unlocked by get_torrent_info() as it polls for
+        readiness below, unless the caller suppressed generation."""
         try:
             hash_value = None
 
@@ -753,8 +748,16 @@ class AllDebridProvider(DebridProvider):
                         # Existing torrent - check if it's ready (statusCode 4)
                         existing_ready = existing.get('statusCode', 0) == 4
                         self._upload_ready_status[existing_id] = existing_ready
-                        if auto_generate:
-                            self._handle_link_generation(existing_id, existing_ready)
+                        # This path returns without polling get_torrent_info, so
+                        # unlock here rather than relying on that hook.
+                        if (existing_ready
+                                and not self._suppress_link_generation
+                                and existing_id not in self._download_links
+                                and self._auto_generate_links_enabled()):
+                            try:
+                                self.generate_download_links(existing_id)
+                            except Exception as e:
+                                logging.error(f"Error generating download links for torrent {existing_id}: {str(e)}")
                         return existing_id
 
                 # Add magnet link
@@ -861,12 +864,9 @@ class AllDebridProvider(DebridProvider):
                     final_ready = is_ready or status_code == 4
                     self._upload_ready_status[torrent_id] = final_ready
 
-                    # Generate the direct download links now that the torrent is
-                    # on AllDebrid. If it is still downloading, defer until the
-                    # status check sees it reach 'Ready'.
-                    if auto_generate:
-                        self._handle_link_generation(torrent_id, status_code == 4, info=info)
-
+                    # Links: the get_torrent_info() call above already unlocked
+                    # this torrent if it was Ready. If it is still downloading,
+                    # the checking queue's later polls will unlock it.
                     return torrent_id
 
                 # Still queued, wait
@@ -1048,13 +1048,19 @@ class AllDebridProvider(DebridProvider):
             else:
                 info['status'] = 'error'
 
-            # Generate download links for torrents that were added before they
-            # finished downloading, now that they are ready.
-            if status_code == 4 and torrent_id in self._pending_link_generation:
+            # Unlock any Ready torrent we look at and have not already unlocked.
+            # Doing it here rather than only at add time means generation is not
+            # lost when the app restarts between adding a torrent and collecting
+            # it, and it covers torrents whose only add happened during a cache
+            # check. Cache probes and deletions suppress this.
+            if (status_code == 4
+                    and not self._suppress_link_generation
+                    and torrent_id not in self._download_links
+                    and self._auto_generate_links_enabled()):
                 try:
                     self.generate_download_links(torrent_id, info=info)
                 except Exception as e:
-                    logging.error(f"Error generating deferred download links for torrent {torrent_id}: {str(e)}")
+                    logging.error(f"Error generating download links for torrent {torrent_id}: {str(e)}")
 
             # Expose any generated direct links alongside the file list
             generated = self._download_links.get(torrent_id)
@@ -1110,13 +1116,12 @@ class AllDebridProvider(DebridProvider):
     def remove_torrent(self, torrent_id: str, removal_reason: str = "Manual removal") -> None:
         """Remove a torrent from AllDebrid"""
         try:
-            # Don't generate links for a torrent we are about to delete
-            self._pending_link_generation.discard(torrent_id)
-
-            # Get torrent info before removal to get the hash
+            # Get torrent info before removal to get the hash. Suppress link
+            # generation - we are about to delete this torrent.
             hash_value = None
             try:
-                info = self.get_torrent_info(torrent_id)
+                with self._link_generation_suppressed():
+                    info = self.get_torrent_info(torrent_id)
                 if info:
                     hash_value = info.get('hash', '').lower()
             except Exception as e:
@@ -1139,7 +1144,6 @@ class AllDebridProvider(DebridProvider):
 
             # Generated links are no longer valid for a removed torrent
             self._download_links.pop(torrent_id, None)
-            self._pending_link_generation.discard(torrent_id)
 
             if hash_value:
                 from database.torrent_tracking import mark_torrent_removed
