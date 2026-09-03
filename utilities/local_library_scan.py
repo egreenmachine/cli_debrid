@@ -1632,7 +1632,15 @@ def check_local_file_for_item(item: Dict[str, Any], is_webhook: bool = False, ex
             # For NZB items in Plex mode with NZB naming enabled: move file to organised structure
             source_file = _apply_nzb_naming(source_file, item)
 
-            if source_folder:
+            # Only consider sibling files when source_folder is genuinely this
+            # torrent's folder. When the file was matched directly under
+            # original_files_path (Attempt 7), the provider presents files flat -
+            # AllDebrid's WebDAV links/ folder, for example - and the "siblings"
+            # are the whole library. Picking the largest of those replaces every
+            # item with whichever single file happens to be biggest, and persists
+            # it to filled_by_file.
+            if source_folder and not (original_path and
+                                      os.path.normpath(source_folder) == os.path.normpath(original_path)):
                 source_file = _prefer_largest_nzb_source(item, source_folder, source_file)
             if _reject_if_nzb_size_too_small(item, source_file):
                 return False
