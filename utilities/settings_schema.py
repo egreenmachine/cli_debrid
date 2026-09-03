@@ -313,6 +313,11 @@ SETTINGS_SCHEMA = {
             "type": "boolean",
             "description": "Before collecting a debrid (Real-Debrid/etc.) file, probe it with ffprobe to confirm it's actually playable, on top of the normal checks. Works in both Symlinked/Local and Plex mode — in Plex mode it runs the moment the file is found on the mount, before cli_debrid tells Plex about it, so a confirmed-broken file is rejected and re-scraped before it ever shows up in Plex. Requires ffprobe to be installed. This will slow down how long it takes items to reach Collected.",
             "default": False
+        },
+        "auto_generate_links": {
+            "type": "boolean",
+            "description": "AllDebrid only: automatically unlock a torrent's files into direct download links as soon as it is added (and once it finishes downloading, for uncached torrents)",
+            "default": True
         }
     },
     "Usenet Provider": {
