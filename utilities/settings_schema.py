@@ -318,6 +318,11 @@ SETTINGS_SCHEMA = {
             "type": "boolean",
             "description": "AllDebrid only: automatically unlock a torrent's files into direct download links as soon as it is added (and once it finishes downloading, for uncached torrents)",
             "default": True
+        },
+        "auto_save_links": {
+            "type": "boolean",
+            "description": "AllDebrid only: also save generated links to your account's Links list ('saved for later'). Required if you mount AllDebrid's WebDAV links folder, since unlocking alone only populates History, which AllDebrid clears after 72 hours. Needs Generate Links enabled.",
+            "default": True
         }
     },
     "Usenet Provider": {

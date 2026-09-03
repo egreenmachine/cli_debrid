@@ -488,6 +488,11 @@ class AllDebridProvider(DebridProvider):
         """Whether download links should be unlocked automatically after adding a torrent."""
         return bool(get_setting('Debrid Provider', 'auto_generate_links', default=True))
 
+    @staticmethod
+    def _auto_save_links_enabled() -> bool:
+        """Whether generated links should also be saved to the account's Links list."""
+        return bool(get_setting('Debrid Provider', 'auto_save_links', default=True))
+
     @contextmanager
     def _link_generation_suppressed(self):
         """
@@ -620,10 +625,41 @@ class AllDebridProvider(DebridProvider):
         if generated:
             self._download_links[torrent_id] = generated
             logging.info(f"Generated {len(generated)} download link(s) for torrent {torrent_id}")
+            if self._auto_save_links_enabled():
+                self.save_links_to_account([g['link'] for g in generated if g.get('link')])
         else:
             logging.warning(f"Failed to generate any download links for torrent {torrent_id}")
 
         return generated
+
+    def save_links_to_account(self, links: List[str]) -> bool:
+        """
+        Save links to the account's "saved for later" list via /user/links/save.
+
+        This is what populates the Links section of AllDebrid's media folder, and
+        therefore what a WebDAV mount of alldebrid:links exposes. Unlocking alone
+        only reaches the History section, which AllDebrid expires after 72 hours,
+        so a mount backed by History would lose the file three days later.
+
+        AllDebrid's docs say to save the original host link rather than an
+        unlocked URL, so this saves the canonical alldebrid.com/f/... links.
+        """
+        if not links:
+            return False
+
+        try:
+            result = make_request('POST', '/user/links/save', self.api_key,
+                                  data={'links[]': links}, use_query_auth=True)
+        except Exception as e:
+            logging.error(f"Failed to save {len(links)} link(s) to account: {str(e)}")
+            return False
+
+        if result and result.get('status') == 'success':
+            logging.info(f"Saved {len(links)} link(s) to the AllDebrid account")
+            return True
+
+        logging.warning(f"Unexpected response saving links to account: {result}")
+        return False
 
     def get_download_links(self, torrent_id: str) -> List[Dict]:
         """Get previously generated download links for a torrent"""
